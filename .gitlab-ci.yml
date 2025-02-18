@@ -1,0 +1,195 @@
+stages:
+  - install
+  - test
+  - build
+  - deploy
+
+variables:
+  IMAGE_NAME: "ram0810/node-app"  # Ensure correct format
+  EC2_USER: ubuntu
+  EC2_HOST: $EC2_PUBLIC_IP  # Replace with your EC2 Public IP
+  SSH_PRIVATE_KEY: $EC2_SSH_PRIVATE_KEY  # Stored as a GitLab CI/CD secret variable
+  DOCKER_HUB_USERNAME: $DOCKER_HUB_USERNAME
+  DOCKER_HUB_PASSWORD: $DOCKER_HUB_PASSWORD
+  DEPLOY_DIR: "/home/ubuntu/node-app"
+
+# Use Node.js Docker image
+image: node:16
+
+# Enable Docker-in-Docker service
+services:
+  - docker:20.10.7-dind  # Docker service in CI environment
+
+# Install dependencies
+install_dependencies:
+  stage: install
+  script:
+    - echo "Installing Node.js dependencies..."
+    - npm install  # Install dependencies from package.json
+  cache:
+    paths:
+      - node_modules/
+
+# Run tests
+run_tests:
+  stage: test
+  script:
+    - echo "Running tests..."
+    - npm install --save-dev mocha  # Ensure Mocha is installed
+    - npm test  # Run tests
+  rules:
+    - if: '$CI_COMMIT_BRANCH != "master"'
+
+# Build and push Docker image to Docker Hub.......
+build_and_push_image:
+  stage: build
+  image: docker:20.10.7
+  script:
+    - echo "$DOCKER_HUB_PASSWORD" | docker login -u "$DOCKER_HUB_USERNAME" --password-stdin
+    - docker build -t "$IMAGE_NAME:$CI_COMMIT_SHA" .
+    - docker push "$IMAGE_NAME:$CI_COMMIT_SHA"
+    - docker tag "$IMAGE_NAME:$CI_COMMIT_SHA" "$IMAGE_NAME:latest"
+    - docker push "$IMAGE_NAME:latest"
+
+
+deploy_on_ec2:
+  stage: deploy
+  before_script:
+    - mkdir -p ~/.ssh
+    - echo "$EC2_PEM_KEY" > ~/.ssh/ec2_key.pem  # Store EC2 private key
+    - chmod 600 ~/.ssh/ec2_key.pem  # Secure the key
+    - ssh-keyscan -H $EC2_HOST >> ~/.ssh/known_hosts
+  script:
+    - echo "Deploying application on EC2 using SSH..."
+    - |
+      ssh -i ~/.ssh/ec2_key.pem $EC2_USER@$EC2_HOST << 'EOF'
+        set -e  # Exit if any command fails
+
+        # Ensure Docker & Docker Compose are installed
+        echo "Ensuring Docker & Docker Compose are installed..."
+        if ! command -v docker &> /dev/null; then
+          echo "Installing Docker..."
+          sudo apt-get update
+          sudo apt-get install -y docker.io
+          sudo usermod -aG docker $USER
+          newgrp docker
+          echo docker ps
+        fi
+
+        if ! command -v docker-compose &> /dev/null; then
+          echo "Installing Docker Compose..."
+          sudo curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+          sudo chmod +x /usr/local/bin/docker-compose
+        fi
+
+        # Set up deployment directory
+        echo "Creating deployment directory..."
+        mkdir -p /home/ubuntu/node-app
+
+        # Stop running containers before updating files
+        echo "Stopping existing container..."
+        cd /home/ubuntu/node-app
+        docker-compose down || true
+      EOF
+
+    # Copy updated application files to EC2 using the `.pem` key
+    - echo "Copying updated files to EC2..."
+    - scp -i ~/.ssh/ec2_key.pem -r docker-compose.yml $EC2_USER@$EC2_HOST:/home/ubuntu/node-app/
+    - scp -i ~/.ssh/ec2_key.pem -r * $EC2_USER@$EC2_HOST:/home/ubuntu/node-app/
+
+    # Restart the application
+    - |
+      ssh -i ~/.ssh/ec2_key.pem $EC2_USER@$EC2_HOST << 'EOF'
+        set -e
+
+        # Navigate to the application directory
+        cd /home/ubuntu/node-app
+
+        # Ensure docker-compose.yml exists
+        if [ ! -f docker-compose.yml ]; then
+          echo "ERROR: docker-compose.yml not found! Exiting..."
+          exit 1
+        fi
+
+        # Pull the latest Docker image from Docker Hub
+        echo "Pulling latest Docker image from Docker Hub..."
+        docker pull ram0810/node-app:latest
+
+        # Start the updated container
+        echo "Starting new container..."
+        docker-compose up -d
+      EOF
+
+
+
+
+
+# # Deploy the application to EC2
+# deploy_on_ec2:
+#   stage: deploy
+#   before_script:
+#     - mkdir -p ~/.ssh
+#     - echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_rsa
+#     - chmod 600 ~/.ssh/id_rsa
+#     - ssh-keyscan -H $EC2_HOST >> ~/.ssh/known_hosts
+#   script:
+#     - echo "Deploying application on EC2 using SSH..."
+#     - |
+#       ssh $EC2_USER@$EC2_HOST << 'EOF'
+#         set -e  # Exit if any command fails
+
+#         # Ensure Docker & Docker Compose are installed
+#         echo "Ensuring Docker & Docker Compose are installed..."
+#         if ! command -v docker &> /dev/null; then
+#           echo "Installing Docker..."
+#           sudo apt-get update
+#           sudo apt-get install -y docker.io
+#         fi
+
+#         if ! command -v docker-compose &> /dev/null; then
+#           echo "Installing Docker Compose..."
+#           sudo curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+#           sudo chmod +x /usr/local/bin/docker-compose
+#         fi
+
+#         # Set up deployment directory
+#         echo "Creating deployment directory..."
+#         mkdir -p /home/ubuntu/node-app
+
+#         # Stop running containers before updating files
+#         echo "Stopping existing container..."
+#         cd /home/ubuntu/node-app
+#         docker-compose down || true
+#       EOF
+
+#     # Copy updated application files from GitLab to EC2
+#     - echo "Copying updated files to EC2..."
+#     - scp -r docker-compose.yml $EC2_USER@$EC2_HOST:/home/ubuntu/node-app/
+#     - scp -r * $EC2_USER@$EC2_HOST:/home/ubuntu/node-app/
+
+#     # Restart the application
+#     - |
+#       ssh $EC2_USER@$EC2_HOST << 'EOF'
+#         set -e
+
+#         # Navigate to the application directory
+#         cd /home/ubuntu/node-app
+
+#         # Ensure docker-compose.yml exists
+#         if [ ! -f docker-compose.yml ]; then
+#           echo "ERROR: docker-compose.yml not found! Exiting..."
+#           exit 1
+#         fi
+
+#         # Pull the latest Docker image from Docker Hub
+#         echo "Pulling latest Docker image from Docker Hub..."
+#         docker pull ram0810/node-app:latest
+
+#         # Start the updated container
+#         echo "Starting new container..."
+#         docker-compose up -d
+#       EOF
+
+
+
+
